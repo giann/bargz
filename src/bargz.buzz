@@ -1,0 +1,363 @@
+import "std";
+import "os";
+import "io";
+import "debug";
+
+object Option {
+    str name,
+    str desc,
+    [str] aliases = [<str>],
+    bool hasValue = false,
+    str? value = null,
+}
+
+object Argument {
+    str name,
+    str desc,
+    int min = 1,
+    int max = 1,
+    [str]? value = null,
+    [str]? defaultValue = null,
+}
+
+object ParseState {
+    int arg = 0,
+    int offset = 0,
+    bool argParsed = false,
+    [Argument] mandatoryArguments = [<Argument>],
+    [str] args,
+}
+
+object ParseError {
+    str? message = null,
+}
+
+object Command {
+    str name,
+    str desc,
+    bool selected = false,
+    [str] aliases = [<str>],
+    {str, Option} options = {<str, Option>},
+    {str, Argument} arguments = {<str, Argument>},
+    {str, Command} commands = {<str, Command>},
+    ParseState? state = null,
+
+    fun clear() > void {
+        this.selected = false;
+        this.state = null;
+
+        foreach (Option option in this.options) {
+            option.value = null;
+        }
+
+        foreach (Argument argument in this.arguments) {
+            argument.value = null;
+        }
+
+        foreach (Command command in this.commands) {
+            command.clear();
+        }
+    }
+
+    fun consumeOption() > void !> ParseError {
+        assert(this.state != null, message: "No state");
+
+        const str current = this.state!.args[this.state!.offset];
+
+        Option? matchingOption = null;
+        foreach (Option option in this.options) {
+            if (current.startsWith("--")) {
+                if (option.name == current.sub(2)) {
+                    matchingOption = option;
+                    break;
+                }
+            } else if (option.aliases.indexOf(current.sub(1)) != null) {
+                matchingOption = option;
+                break;
+            }
+        }
+
+        if (matchingOption -> option) {
+            if (option.hasValue) {
+                this.state!.offset = this.state!.offset + 1;
+                option.value = this.state!.args[this.state!.offset];
+            } else {
+                option.value = "true"; 
+            }
+
+            this.state!.offset = this.state!.offset + 1;
+
+            return;
+        }
+
+        throw ParseError{ message = "Option `{current}` does not exists" };
+    }
+
+    fun consumeArgument() > void !> ParseError {
+        assert(this.state != null, message: "No state");
+
+        const Argument? currentArg = if (this.arguments.size() > 0 and this.state!.arg < this.arguments.size())
+            this.arguments[this.arguments.keys()[this.state!.arg]]
+        else
+            null;
+        
+        if (currentArg -> arg) {
+            [str] value = [<str>];
+            for (int i = 0; i < arg.max and this.state!.offset < this.state!.args.len(); i = i + 1) {
+                value.append(this.state!.args[this.state!.offset]);
+                this.state!.offset = this.state!.offset + 1;
+
+                | Next is not an argument
+                if ((this.state!.offset >= this.state!.args.len() or this.state!.args[this.state!.offset].startsWith("-"))
+                    and i + 1 < arg.max) {
+                    if (i + 1 >= arg.min) {
+                        break;
+                    } else {
+                        throw ParseError{ message = "Argument `{arg.name}` expects at least {arg.min} elements, {i + 1} provided" };
+                    }
+                }
+            }
+
+            arg.value = value;
+        } else {
+            return;
+        }
+
+        this.state!.arg = this.state!.arg + 1;
+        
+        | If we parsed all arguments or at least mandatory ones, set flag
+        this.state!.argParsed = this.state!.arg >= this.arguments.size()
+            or (this.state!.args[this.state!.offset].startsWith("-") and this.state!.arg >= this.state!.mandatoryArguments.len());
+    }
+
+    fun consumeCommand() > bool {
+        const str current = if (this.state != null) this.state!.args[this.state!.offset] else "";
+
+        | Could it be a sub-command?
+        Command? selectedCommand = null;
+        foreach (Command command in this.commands) {
+            if (current == command.name or command.aliases.indexOf(current) != null) {
+                selectedCommand = command;
+                this.state!.offset = this.state!.offset + 1;
+                break;
+            }
+        }
+
+        if (selectedCommand -> command) {
+            command.state = this.state;
+            command.parse((this.state?.args ?? [<str>]).sub(this.state?.offset ?? 0));
+
+            return true;
+        }
+
+        return false;
+    }
+
+    fun parse([str] args) > Command {
+        try {
+            this.selected = true;
+
+            [Argument] mandatoryArguments = [<Argument>];
+            foreach (Argument arg in this.arguments) {
+                if (arg.min > 0) {
+                    mandatoryArguments.append(arg);
+                }
+            }
+
+            ParseState state = ParseState{
+                args = args,
+                | ça merde?
+                mandatoryArguments = mandatoryArguments,
+            };
+            | ça merde?
+            this.state = state;
+        
+            while (state.offset < args.len()) {
+                const str arg = args[state.offset];
+
+                if (arg[0] == "-") {
+                    | Did we parse required arguments before?
+                    if (!state.argParsed and state.arg != 0 and this.arguments.size() > 0 and state.mandatoryArguments.len() > 0) {
+                        throw ParseError{ message = "Missing arguments" };
+                    }
+
+                    | It's an option
+                    this.consumeOption();
+                } else {
+                    | It's either an argument or a sub-command
+
+                    | Is there some required arguments?
+                    if (!state.argParsed and state.mandatoryArguments.len() > 0) {
+                        this.consumeArgument();
+                    } else if (!this.consumeCommand()) {
+                        | It must be an argument
+                        this.consumeArgument();
+                    } else {
+                        return;
+                    }
+                }
+            }
+        } catch (ParseError error) {
+            this.error(error);
+        }
+
+        return this;
+    }
+
+    fun usage() > void {
+        try {
+            stderr.write("Usage: {this.name} ");
+
+            foreach (Option option in this.options) {
+                stderr.write("[--{option.name}");
+
+                if (option.hasValue) {
+                    stderr.write(" <{option.name}>");
+                }
+
+                stderr.write("] ");
+            }
+
+            foreach (Argument argument in this.arguments) {
+                if (argument.min == 0) {
+                    stderr.write("[");
+                }
+
+                stderr.write("<{argument.name}");
+
+                if (argument.min > 1 or argument.max > 1) {
+                    stderr.write(", ...");
+                }
+
+                stderr.write(">");
+
+                if (argument.min == 0) {
+                    if (argument.defaultValue -> value) {
+                        stderr.write("={value.join(", ")}");
+                    }
+                    stderr.write("]");
+                }
+
+                stderr.write(" ");
+            }
+
+            if (this.commands.size() > 0) {
+                stderr.write("<command> ...");
+            }
+        } catch {}
+    }
+
+    fun error(ParseError error) {
+        this.usage();
+
+        stderr.write("\n\nError: {error.message ?? "could not parse arguments"}\n\n") catch void;
+    }
+
+    fun help() > void {
+        try {
+            this.usage();
+
+            stderr.write("\n\n{this.desc}");
+
+            if (this.options.size() > 0) {
+                stderr.write("\n\nOptions:\n");
+                foreach (Option option in this.options) {
+                    stderr.write("   --{option.name}");
+                    foreach (str alias in option.aliases) {
+                        stderr.write(", -{alias}");
+                    }
+                    if (option.hasValue) {
+                        stderr.write(" <{option.name}>");
+                    }
+                    stderr.write("\t{option.desc}\n");
+                }
+            }
+
+            if (this.commands.size() > 0) {
+                stderr.write("\nCommands:\n");
+                foreach (Command command in this.commands) {
+                    stderr.write("   {command.name}");
+                    foreach (str alias in command.aliases) {
+                        stderr.write(", {alias}");
+                    }
+                    stderr.write("\t --{command.desc}\n");
+                }
+            }
+        } catch {}
+    }
+}
+
+test "bargz" {
+    [str] args = "one two three --option 12 -d on list --help".split(" ");
+
+    Command command = Command{
+        name = "test",
+        desc = "Test things out",
+        arguments = {
+            "first": Argument{
+                name = "first",
+                desc = "First ones",
+                min = 1,
+                max = 2,
+            },
+            "second": Argument{
+                name = "second",
+                desc = "Second ones",
+            },
+        },
+        options = {
+            "option": Option{
+                name = "option",
+                desc = "Option is optional",
+                hasValue = true,
+            },
+            "debug": Option{
+                name = "debug",
+                desc = "Debug things",
+                aliases = [ "d" ],
+                hasValue = true,
+            },
+            "help": Option{
+                name = "help",
+                desc = "Show this help message",
+                aliases = [ "h" ],
+            }
+        },
+        commands = {
+            "list": Command{
+                name = "list",
+                desc = "List things",
+                arguments = {
+                    "dir": Argument{
+                        name = "dir",
+                        desc = "Which directory to list",
+                    }
+                },
+                options = {
+                    "help": Option{
+                        name = "help",
+                        desc = "Show this help message",
+                        aliases = [ "h" ],
+                    }
+                }
+            }
+        }
+    };
+
+    command.parse(args);
+
+    if (command.options["help"]?.value != null) {
+        command.help();
+        return;
+    }
+
+    const Command listCommand = command.commands["list"]!;
+    if (listCommand.selected and listCommand.options["help"]?.value != null) {
+        listCommand.help();
+        return;
+    }
+}
+
+export Argument;
+export Option;
+export Command;
