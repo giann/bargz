@@ -3,7 +3,7 @@ import "os";
 import "io";
 import "debug";
 
-object Option {
+export object Option {
     str name,
     str desc,
     [str] aliases = [<str>],
@@ -11,7 +11,7 @@ object Option {
     str? value = null,
 }
 
-object Argument {
+export object Argument {
     str name,
     str desc,
     int min = 1,
@@ -32,7 +32,7 @@ object ParseError {
     str? message = null,
 }
 
-object Command {
+export object Command {
     str name,
     str desc,
     bool selected = false,
@@ -357,7 +357,3 @@ test "bargz" {
         return;
     }
 }
-
-export Argument;
-export Option;
-export Command;
